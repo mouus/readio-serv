@@ -3,40 +3,60 @@ import {
 } from "@neondatabase/serverless";
 
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
+
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+
+import {
+  getSignedUrl,
+} from "@aws-sdk/s3-request-presigner";
 
 import OpenAI from "openai";
 
-if (!process.env.DATABASE_URL) {
+import {
+  s3BucketName,
+  s3Client,
+} from "../config/s3.js";
+
+if (
+  !process.env.DATABASE_URL
+) {
   throw new Error(
-    "DATABASE_URL is missing from the backend .env file."
+    "DATABASE_URL is missing from the backend environment variables."
   );
 }
 
-if (!process.env.OPENAI_API_KEY) {
+if (
+  !process.env.OPENAI_API_KEY
+) {
   throw new Error(
-    "OPENAI_API_KEY is missing from the backend .env file."
+    "OPENAI_API_KEY is missing from the backend environment variables."
   );
 }
 
-const sql = neon(
-  process.env.DATABASE_URL
-);
-
-const openai = new OpenAI({
-  apiKey:
-    process.env.OPENAI_API_KEY,
-});
-
-const SPEECH_OUTPUT_DIRECTORY =
-  path.resolve(
-    "uploads",
-    "speech"
+const sql =
+  neon(
+    process.env.DATABASE_URL
   );
 
-const MAX_SPEECH_LENGTH = 4096;
-const QUESTION_CONTEXT_LENGTH = 10000;
+const openai =
+  new OpenAI({
+    apiKey:
+      process.env
+        .OPENAI_API_KEY,
+  });
+
+const MAX_SPEECH_LENGTH =
+  4096;
+
+const QUESTION_CONTEXT_LENGTH =
+  10000;
+
+const SIGNED_URL_EXPIRATION =
+  60 * 60;
 
 const AVAILABLE_VOICES = [
   "alloy",
@@ -87,15 +107,25 @@ const cleanText = (
   value
 ) => {
   if (
-    typeof value !== "string"
+    typeof value !==
+    "string"
   ) {
     return "";
   }
 
   return value
-    .replace(/\u0000/g, "")
-    .replace(/\r/g, "")
-    .replace(/\s+/g, " ")
+    .replace(
+      /\u0000/g,
+      ""
+    )
+    .replace(
+      /\r/g,
+      ""
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim();
 };
 
@@ -109,7 +139,9 @@ const clampNumber = (
     Number(value);
 
   if (
-    !Number.isFinite(parsed)
+    !Number.isFinite(
+      parsed
+    )
   ) {
     return fallback;
   }
@@ -123,26 +155,6 @@ const clampNumber = (
   );
 };
 
-const getBaseUrl = (
-  req
-) => {
-  const configuredUrl =
-    process.env
-      .PUBLIC_SERVER_URL;
-
-  if (configuredUrl) {
-    return configuredUrl.replace(
-      /\/+$/,
-      ""
-    );
-  }
-
-  return (
-    `${req.protocol}://` +
-    `${req.get("host")}`
-  );
-};
-
 const getSpeechFilename = ({
   text,
   voice,
@@ -151,7 +163,9 @@ const getSpeechFilename = ({
 }) => {
   const hash =
     crypto
-      .createHash("sha256")
+      .createHash(
+        "sha256"
+      )
       .update(
         JSON.stringify({
           text,
@@ -160,22 +174,86 @@ const getSpeechFilename = ({
           speed,
         })
       )
-      .digest("hex")
-      .slice(0, 32);
+      .digest(
+        "hex"
+      )
+      .slice(
+        0,
+        32
+      );
 
   return `${hash}.mp3`;
 };
 
-const fileExists =
+const getSpeechS3Key = (
+  filename
+) => {
+  return `speech/${filename}`;
+};
+
+const s3ObjectExists =
   async (
-    filePath
+    key
   ) => {
     try {
-      await fs.access(filePath);
+      await s3Client.send(
+        new HeadObjectCommand({
+          Bucket:
+            s3BucketName,
+
+          Key:
+            key,
+        })
+      );
+
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      const statusCode =
+        error?.$metadata
+          ?.httpStatusCode;
+
+      if (
+        statusCode === 404 ||
+        error?.name ===
+          "NotFound" ||
+        error?.name ===
+          "NoSuchKey"
+      ) {
+        return false;
+      }
+
+      throw error;
     }
+  };
+
+const createSignedAudioUrl =
+  async (
+    key,
+    filename
+  ) => {
+    const command =
+      new GetObjectCommand({
+        Bucket:
+          s3BucketName,
+
+        Key:
+          key,
+
+        ResponseContentType:
+          "audio/mpeg",
+
+        ResponseContentDisposition:
+          `inline; filename="${filename}"`,
+      });
+
+    return getSignedUrl(
+      s3Client,
+      command,
+      {
+        expiresIn:
+          SIGNED_URL_EXPIRATION,
+      }
+    );
   };
 
 const getQuestionExcerpt = (
@@ -195,7 +273,10 @@ const getQuestionExcerpt = (
   const randomStart =
     Math.floor(
       Math.random() *
-        (maximumStart + 1)
+        (
+          maximumStart +
+          1
+        )
     );
 
   const nextSpace =
@@ -206,7 +287,9 @@ const getQuestionExcerpt = (
 
   const start =
     nextSpace >= 0 &&
-    nextSpace - randomStart < 100
+    nextSpace -
+      randomStart <
+      100
       ? nextSpace + 1
       : randomStart;
 
@@ -223,7 +306,9 @@ const formatGeneratedQuestion = (
   value
 ) => {
   let question =
-    cleanText(value)
+    cleanText(
+      value
+    )
       .replace(
         /^(?:question|q)\s*:\s*/i,
         ""
@@ -238,22 +323,24 @@ const formatGeneratedQuestion = (
       )
       .trim();
 
-  /*
-    In case the model returned extra
-    text after the first question.
-  */
   const questionMarkIndex =
-    question.indexOf("?");
+    question.indexOf(
+      "?"
+    );
 
   if (
-    questionMarkIndex >= 0
+    questionMarkIndex >=
+    0
   ) {
     question =
       question.slice(
         0,
-        questionMarkIndex + 1
+        questionMarkIndex +
+          1
       );
-  } else if (question) {
+  } else if (
+    question
+  ) {
     question += "?";
   }
 
@@ -261,8 +348,8 @@ const formatGeneratedQuestion = (
 };
 
 /*
-  GET /api/speech/options
-*/
+ * GET /api/speech/options
+ */
 export const getSpeechOptions =
   async (
     req,
@@ -273,7 +360,8 @@ export const getSpeechOptions =
       return res
         .status(200)
         .json({
-          success: true,
+          success:
+            true,
 
           options: {
             voices:
@@ -295,7 +383,8 @@ export const getSpeechOptions =
             defaultStyle:
               "calm",
 
-            defaultSpeed: 1,
+            defaultSpeed:
+              1,
           },
         });
     } catch (error) {
@@ -309,16 +398,16 @@ export const getSpeechOptions =
   };
 
 /*
-  POST /api/speech/generate
-
-  Body:
-  {
-    text: string,
-    voice?: string,
-    style?: string,
-    speed?: number
-  }
-*/
+ * POST /api/speech/generate
+ *
+ * Body:
+ * {
+ *   text: string,
+ *   voice?: string,
+ *   style?: string,
+ *   speed?: number
+ * }
+ */
 export const generateSpeech =
   async (
     req,
@@ -367,7 +456,9 @@ export const generateSpeech =
         return res
           .status(400)
           .json({
-            success: false,
+            success:
+              false,
+
             message:
               "Speech text is required.",
           });
@@ -380,19 +471,13 @@ export const generateSpeech =
         return res
           .status(400)
           .json({
-            success: false,
+            success:
+              false,
 
             message:
               `Speech text must be ${MAX_SPEECH_LENGTH} characters or fewer.`,
           });
       }
-
-      await fs.mkdir(
-        SPEECH_OUTPUT_DIRECTORY,
-        {
-          recursive: true,
-        }
-      );
 
       const filename =
         getSpeechFilename({
@@ -402,15 +487,14 @@ export const generateSpeech =
           speed,
         });
 
-      const outputPath =
-        path.join(
-          SPEECH_OUTPUT_DIRECTORY,
+      const s3Key =
+        getSpeechS3Key(
           filename
         );
 
       const cached =
-        await fileExists(
-          outputPath
+        await s3ObjectExists(
+          s3Key
         );
 
       if (!cached) {
@@ -426,7 +510,8 @@ export const generateSpeech =
 
               voice,
 
-              input: text,
+              input:
+                text,
 
               instructions:
                 STYLE_INSTRUCTIONS[
@@ -444,34 +529,85 @@ export const generateSpeech =
             await speech.arrayBuffer()
           );
 
-        await fs.writeFile(
-          outputPath,
-          audioBuffer
+        await s3Client.send(
+          new PutObjectCommand({
+            Bucket:
+              s3BucketName,
+
+            Key:
+              s3Key,
+
+            Body:
+              audioBuffer,
+
+            ContentType:
+              "audio/mpeg",
+
+            ContentLength:
+              audioBuffer.length,
+
+            ContentDisposition:
+              `inline; filename="${filename}"`,
+
+            CacheControl:
+              "private, max-age=31536000",
+
+            Metadata: {
+              voice,
+              style,
+
+              speed:
+                String(
+                  speed
+                ),
+            },
+          })
+        );
+
+        console.log(
+          "Speech uploaded to S3:",
+          {
+            bucket:
+              s3BucketName,
+
+            key:
+              s3Key,
+
+            size:
+              audioBuffer.length,
+          }
         );
       }
 
-      const baseUrl =
-        getBaseUrl(req);
-
       const url =
-        `${baseUrl}/uploads/speech/` +
-        encodeURIComponent(
+        await createSignedAudioUrl(
+          s3Key,
           filename
         );
 
       return res
         .status(200)
         .json({
-          success: true,
+          success:
+            true,
 
           audio: {
             voice,
             style,
             speed,
             filename,
+
+            s3Key,
+
             cached,
+
             url,
-            aiGenerated: true,
+
+            expiresIn:
+              SIGNED_URL_EXPIRATION,
+
+            aiGenerated:
+              true,
           },
         });
     } catch (error) {
@@ -485,14 +621,14 @@ export const generateSpeech =
   };
 
 /*
-  POST /api/speech/question
-
-  Body:
-  {
-    documentId: string,
-    previousQuestion?: string
-  }
-*/
+ * POST /api/speech/question
+ *
+ * Body:
+ * {
+ *   documentId: string,
+ *   previousQuestion?: string
+ * }
+ */
 export const generateQuestion =
   async (
     req,
@@ -502,7 +638,8 @@ export const generateQuestion =
     try {
       const documentId =
         cleanText(
-          req.body?.documentId
+          req.body
+            ?.documentId
         );
 
       const previousQuestion =
@@ -518,28 +655,34 @@ export const generateQuestion =
         return res
           .status(400)
           .json({
-            success: false,
+            success:
+              false,
+
             message:
               "documentId is required.",
           });
       }
 
-      const rows = await sql`
-        SELECT
-          id,
-          name,
-          extracted_text,
-          has_text
-        FROM documents
-        WHERE id = ${documentId}
-        LIMIT 1
-      `;
+      const rows =
+        await sql`
+          SELECT
+            id,
+            name,
+            extracted_text,
+            has_text
+          FROM documents
+          WHERE id =
+            ${documentId}
+          LIMIT 1
+        `;
 
       if (!rows.length) {
         return res
           .status(404)
           .json({
-            success: false,
+            success:
+              false,
+
             message:
               "Document not found.",
           });
@@ -561,7 +704,8 @@ export const generateQuestion =
         return res
           .status(422)
           .json({
-            success: false,
+            success:
+              false,
 
             message:
               "This PDF does not contain readable text.",
@@ -586,68 +730,75 @@ export const generateQuestion =
           ? `Do not repeat this previous question: ${previousQuestion}`
           : "",
       ]
-        .filter(Boolean)
-        .join(" ");
+        .filter(
+          Boolean
+        )
+        .join(
+          " "
+        );
 
       const response =
-        await openai.responses.create({
-          model:
-            process.env
-              .OPENAI_QUESTION_MODEL ||
-            "gpt-5-mini",
+        await openai
+          .responses
+          .create({
+            model:
+              process.env
+                .OPENAI_QUESTION_MODEL ||
+              "gpt-5-mini",
 
-          store: false,
+            store:
+              false,
 
-          /*
-            80 was too small for some reasoning
-            models and could produce no visible text.
-          */
-          max_output_tokens: 300,
+            max_output_tokens:
+              300,
 
-          reasoning: {
-            effort: "minimal",
-          },
-
-          input: [
-            {
-              role: "developer",
-
-              content: [
-                {
-                  type:
-                    "input_text",
-
-                  text:
-                    instructions,
-                },
-              ],
+            reasoning: {
+              effort:
+                "minimal",
             },
 
-            {
-              role: "user",
+            input: [
+              {
+                role:
+                  "developer",
 
-              content: [
-                {
-                  type:
-                    "input_text",
+                content: [
+                  {
+                    type:
+                      "input_text",
 
-                  text: [
-                    `PDF title: ${
-                      document.name ||
-                      "Untitled PDF"
-                    }`,
+                    text:
+                      instructions,
+                  },
+                ],
+              },
 
-                    "PDF excerpt:",
+              {
+                role:
+                  "user",
 
-                    excerpt,
-                  ].join(
-                    "\n\n"
-                  ),
-                },
-              ],
-            },
-          ],
-        });
+                content: [
+                  {
+                    type:
+                      "input_text",
+
+                    text: [
+                      `PDF title: ${
+                        document.name ||
+                        "Untitled PDF"
+                      }`,
+
+                      "PDF excerpt:",
+
+                      excerpt,
+                    ].join(
+                      "\n\n"
+                    ),
+                  },
+                ],
+              },
+            ],
+          });
 
       console.log(
         "Question response status:",
@@ -666,39 +817,48 @@ export const generateQuestion =
         response.output_text
       );
 
-      /*
-        output_text is the normal SDK helper.
-
-        The fallback handles responses where text
-        exists inside the raw output structure.
-      */
       let rawQuestion =
-        typeof response.output_text ===
+        typeof response
+          .output_text ===
         "string"
-          ? response.output_text
+          ? response
+              .output_text
           : "";
 
-      if (!rawQuestion.trim()) {
+      if (
+        !rawQuestion.trim()
+      ) {
         rawQuestion =
           response.output
             ?.flatMap(
-              (item) =>
+              (
+                item
+              ) =>
                 item.type ===
                 "message"
-                  ? item.content || []
+                  ? item.content ||
+                    []
                   : []
             )
             .filter(
-              (content) =>
+              (
+                content
+              ) =>
                 content.type ===
                 "output_text"
             )
             .map(
-              (content) =>
-                content.text || ""
+              (
+                content
+              ) =>
+                content.text ||
+                ""
             )
-            .join(" ")
-            .trim() || "";
+            .join(
+              " "
+            )
+            .trim() ||
+          "";
       }
 
       const question =
@@ -719,7 +879,8 @@ export const generateQuestion =
         return res
           .status(502)
           .json({
-            success: false,
+            success:
+              false,
 
             message:
               response.status ===
@@ -732,7 +893,9 @@ export const generateQuestion =
       return res
         .status(200)
         .json({
-          success: true,
+          success:
+            true,
+
           question,
         });
     } catch (error) {
