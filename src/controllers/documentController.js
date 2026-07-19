@@ -24,9 +24,7 @@ import {
   s3Client,
 } from "../config/s3.js";
 
-if (
-  !process.env.DATABASE_URL
-) {
+if (!process.env.DATABASE_URL) {
   throw new Error(
     "DATABASE_URL is missing from the backend environment variables."
   );
@@ -40,17 +38,31 @@ const sql =
 const SIGNED_URL_EXPIRATION =
   60 * 60;
 
+/*
+ * Cleans extracted text.
+ *
+ * unpdf returns:
+ * - one string when mergePages is true
+ * - an array of page strings when mergePages is false
+ */
 const cleanExtractedText = (
   value
 ) => {
-  if (
-    typeof value !==
-    "string"
-  ) {
-    return "";
-  }
+  const rawText =
+    Array.isArray(value)
+      ? value
+          .filter(
+            (item) =>
+              typeof item ===
+              "string"
+          )
+          .join("\n\n")
+      : typeof value ===
+          "string"
+        ? value
+        : "";
 
-  return value
+  return rawText
     .replace(
       /\u0000/g,
       ""
@@ -73,6 +85,284 @@ const cleanExtractedText = (
     )
     .trim();
 };
+
+/*
+ * Checks whether the uploaded buffer
+ * looks like a real PDF.
+ */
+const isPdfBuffer = (
+  buffer
+) => {
+  if (
+    !Buffer.isBuffer(
+      buffer
+    ) ||
+    buffer.length < 5
+  ) {
+    return false;
+  }
+
+  /*
+   * Most PDFs start with %PDF-.
+   *
+   * Some valid PDFs have a few bytes
+   * before the header, so inspect the
+   * first 1 KB.
+   */
+  const beginning =
+    buffer
+      .subarray(
+        0,
+        Math.min(
+          buffer.length,
+          1024
+        )
+      )
+      .toString(
+        "latin1"
+      );
+
+  return beginning.includes(
+    "%PDF-"
+  );
+};
+
+/*
+ * Extracts text directly from the
+ * Multer memory buffer.
+ *
+ * S3 is not involved in extraction.
+ */
+const extractPdfTextFromBuffer =
+  async (
+    pdfBuffer
+  ) => {
+    if (
+      !isPdfBuffer(
+        pdfBuffer
+      )
+    ) {
+      throw new Error(
+        "The uploaded file does not contain a valid PDF header."
+      );
+    }
+
+    /*
+     * Always create a fresh byte array.
+     *
+     * This prevents PDF.js from sharing or
+     * modifying the same memory later used
+     * for the S3 upload.
+     */
+    const createPdfBytes =
+      () =>
+        Uint8Array.from(
+          pdfBuffer
+        );
+
+    let pdf =
+      null;
+
+    let totalPages =
+      0;
+
+    let mergedExtractionError =
+      null;
+
+    try {
+      /*
+       * First attempt:
+       * create a PDF document proxy.
+       */
+      pdf =
+        await getDocumentProxy(
+          createPdfBytes()
+        );
+
+      totalPages =
+        Number(
+          pdf.numPages ||
+            0
+        );
+
+      /*
+       * First extraction method:
+       * merge all pages into one string.
+       */
+      try {
+        const mergedResult =
+          await extractText(
+            pdf,
+            {
+              mergePages:
+                true,
+            }
+          );
+
+        totalPages =
+          Number(
+            mergedResult
+              .totalPages ||
+              totalPages ||
+              0
+          );
+
+        const mergedText =
+          cleanExtractedText(
+            mergedResult.text
+          );
+
+        if (mergedText) {
+          return {
+            text:
+              mergedText,
+
+            totalPages,
+
+            method:
+              "merged",
+          };
+        }
+      } catch (error) {
+        mergedExtractionError =
+          error;
+
+        console.error(
+          "Merged PDF extraction failed:",
+          {
+            name:
+              error?.name,
+
+            message:
+              error?.message,
+          }
+        );
+      }
+
+      /*
+       * Second extraction method:
+       * extract one string per page.
+       */
+      try {
+        const pageResult =
+          await extractText(
+            pdf,
+            {
+              mergePages:
+                false,
+            }
+          );
+
+        totalPages =
+          Number(
+            pageResult
+              .totalPages ||
+              totalPages ||
+              0
+          );
+
+        const pageText =
+          cleanExtractedText(
+            pageResult.text
+          );
+
+        return {
+          text:
+            pageText,
+
+          totalPages,
+
+          method:
+            "pages",
+        };
+      } catch (pageError) {
+        console.error(
+          "Page-by-page PDF extraction failed:",
+          {
+            name:
+              pageError?.name,
+
+            message:
+              pageError?.message,
+          }
+        );
+
+        /*
+         * Throw the more recent error,
+         * unless only the merged method failed.
+         */
+        throw (
+          pageError ||
+          mergedExtractionError
+        );
+      }
+    } catch (proxyError) {
+      console.error(
+        "PDF proxy extraction failed:",
+        {
+          name:
+            proxyError?.name,
+
+          message:
+            proxyError?.message,
+        }
+      );
+
+      /*
+       * Final fallback:
+       *
+       * unpdf can also extract directly
+       * from raw PDF bytes without manually
+       * creating a document proxy.
+       */
+      const fallbackResult =
+        await extractText(
+          createPdfBytes(),
+          {
+            mergePages:
+              false,
+          }
+        );
+
+      const fallbackText =
+        cleanExtractedText(
+          fallbackResult.text
+        );
+
+      return {
+        text:
+          fallbackText,
+
+        totalPages:
+          Number(
+            fallbackResult
+              .totalPages ||
+              totalPages ||
+              0
+          ),
+
+        method:
+          "raw-bytes",
+      };
+    } finally {
+      if (
+        pdf &&
+        typeof pdf.destroy ===
+          "function"
+      ) {
+        try {
+          await pdf.destroy();
+        } catch (
+          destroyError
+        ) {
+          console.warn(
+            "Could not destroy PDF proxy:",
+            destroyError
+          );
+        }
+      }
+    }
+  };
 
 const calculateDocumentStats = (
   text
@@ -103,10 +393,10 @@ const calculateDocumentStats = (
 
 /*
  * Upload requests send clerkUuid
- * through req.body.
+ * in req.body.
  *
  * GET and DELETE requests send
- * clerkUuid through req.query.
+ * clerkUuid in req.query.
  */
 const getClerkUuid = (
   req
@@ -250,7 +540,8 @@ const formatDocument =
         row.name,
 
       /*
-       * filename is now the S3 object key.
+       * filename and file_url contain
+       * the private S3 object key.
        */
       filename:
         row.filename,
@@ -265,12 +556,15 @@ const formatDocument =
         ),
 
       /*
-       * This is a private temporary S3 URL.
-       * It expires after one hour.
+       * Temporary private S3 URL.
        */
       url:
         signedUrl,
 
+      /*
+       * The frontend turns this relative
+       * path into a complete backend URL.
+       */
       textUrl:
         `/api/documents/` +
         `${encodeURIComponent(
@@ -337,9 +631,7 @@ const userExists =
         LIMIT 1
       `;
 
-    return (
-      rows.length > 0
-    );
+    return rows.length > 0;
   };
 
 const removeS3Object =
@@ -361,6 +653,9 @@ const removeS3Object =
     );
   };
 
+/*
+ * POST /api/documents/upload
+ */
 export const uploadDocument =
   async (
     req,
@@ -419,6 +714,10 @@ export const uploadDocument =
         req.documentId ||
         crypto.randomUUID();
 
+      /*
+       * Multer memoryStorage places
+       * the uploaded PDF here.
+       */
       const pdfBuffer =
         req.file.buffer;
 
@@ -439,41 +738,66 @@ export const uploadDocument =
       let totalPages =
         0;
 
+      let extractionMethod =
+        null;
+
       let extractionError =
         null;
 
+      /*
+       * Extract text before uploading
+       * the PDF buffer to S3.
+       */
       try {
-        const pdf =
-          await getDocumentProxy(
-            new Uint8Array(
-              pdfBuffer
-            )
-          );
-
-        const result =
-          await extractText(
-            pdf,
-            {
-              mergePages:
-                true,
-            }
-          );
-
-        totalPages =
-          Number(
-            result
-              .totalPages ||
-              0
+        const extraction =
+          await extractPdfTextFromBuffer(
+            pdfBuffer
           );
 
         extractedText =
-          cleanExtractedText(
-            result.text
-          );
+          extraction.text;
+
+        totalPages =
+          extraction.totalPages;
+
+        extractionMethod =
+          extraction.method;
+
+        console.log(
+          "PDF text extraction result:",
+          {
+            pages:
+              totalPages,
+
+            characters:
+              extractedText.length,
+
+            method:
+              extractionMethod,
+
+            hasText:
+              extractedText.length >
+              0,
+          }
+        );
+
+        if (!extractedText) {
+          extractionError =
+            "The PDF was uploaded, but it does not contain an extractable text layer. It may be scanned or image-only.";
+        }
       } catch (error) {
         console.error(
           "PDF text extraction error:",
-          error
+          {
+            name:
+              error?.name,
+
+            message:
+              error?.message,
+
+            stack:
+              error?.stack,
+          }
         );
 
         extractionError =
@@ -519,6 +843,10 @@ export const uploadDocument =
         }
       );
 
+      /*
+       * Upload the original PDF buffer
+       * to private Amazon S3 storage.
+       */
       await s3Client.send(
         new PutObjectCommand({
           Bucket:
@@ -571,6 +899,8 @@ export const uploadDocument =
             totalPages,
 
           wordCount,
+
+          extractionMethod,
         }
       );
 
@@ -648,6 +978,24 @@ export const uploadDocument =
             extractionError ||
             "PDF uploaded to S3 and saved successfully.",
 
+          extraction: {
+            success:
+              extractedText.length >
+              0,
+
+            characters:
+              extractedText.length,
+
+            pages:
+              totalPages,
+
+            method:
+              extractionMethod,
+
+            message:
+              extractionError,
+          },
+
           document,
         });
     } catch (error) {
@@ -657,12 +1005,11 @@ export const uploadDocument =
       );
 
       /*
-       * If S3 succeeded but Neon failed,
-       * remove the unfinished S3 object.
+       * If S3 upload succeeded but the
+       * Neon insert failed, remove the
+       * unfinished S3 object.
        */
-      if (
-        uploadedS3Key
-      ) {
+      if (uploadedS3Key) {
         try {
           await removeS3Object(
             uploadedS3Key
@@ -713,6 +1060,9 @@ export const uploadDocument =
     }
   };
 
+/*
+ * GET /api/documents
+ */
 export const listDocuments =
   async (
     req,
@@ -763,9 +1113,7 @@ export const listDocuments =
       const documents =
         await Promise.all(
           rows.map(
-            (
-              row
-            ) =>
+            (row) =>
               formatDocument(
                 row
               )
@@ -793,6 +1141,9 @@ export const listDocuments =
     }
   };
 
+/*
+ * GET /api/documents/:id
+ */
 export const getDocument =
   async (
     req,
@@ -876,6 +1227,9 @@ export const getDocument =
     }
   };
 
+/*
+ * GET /api/documents/:id/text
+ */
 export const getDocumentText =
   async (
     req,
@@ -992,6 +1346,9 @@ export const getDocumentText =
     }
   };
 
+/*
+ * DELETE /api/documents/:id
+ */
 export const deleteDocument =
   async (
     req,
@@ -1015,8 +1372,8 @@ export const deleteDocument =
       }
 
       /*
-       * Get the S3 key before deleting
-       * the Neon row.
+       * Read the S3 key before deleting
+       * the Neon document row.
        */
       const rows =
         await sql`
@@ -1052,10 +1409,17 @@ export const deleteDocument =
         document.file_url ||
         document.filename;
 
+      /*
+       * Delete the actual PDF from S3.
+       */
       await removeS3Object(
         s3Key
       );
 
+      /*
+       * Delete its metadata and extracted
+       * text from Neon.
+       */
       await sql`
         DELETE FROM documents
         WHERE
@@ -1084,6 +1448,9 @@ export const deleteDocument =
     }
   };
 
+/*
+ * GET /api/documents/health
+ */
 export const getServerHealth =
   async (
     req,

@@ -5,8 +5,8 @@ import {
 import crypto from "node:crypto";
 
 import {
-  DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
 
@@ -14,19 +14,26 @@ import {
   getSignedUrl,
 } from "@aws-sdk/s3-request-presigner";
 
-import {
-  extractText,
-  getDocumentProxy,
-} from "unpdf";
+import OpenAI from "openai";
 
 import {
   s3BucketName,
   s3Client,
 } from "../config/s3.js";
 
-if (!process.env.DATABASE_URL) {
+if (
+  !process.env.DATABASE_URL
+) {
   throw new Error(
     "DATABASE_URL is missing from the backend environment variables."
+  );
+}
+
+if (
+  !process.env.OPENAI_API_KEY
+) {
+  throw new Error(
+    "OPENAI_API_KEY is missing from the backend environment variables."
   );
 }
 
@@ -35,34 +42,78 @@ const sql =
     process.env.DATABASE_URL
   );
 
+const openai =
+  new OpenAI({
+    apiKey:
+      process.env
+        .OPENAI_API_KEY,
+  });
+
+const MAX_SPEECH_LENGTH =
+  4096;
+
+const QUESTION_CONTEXT_LENGTH =
+  10000;
+
 const SIGNED_URL_EXPIRATION =
   60 * 60;
 
-/*
- * Cleans extracted text.
- *
- * unpdf returns:
- * - one string when mergePages is true
- * - an array of page strings when mergePages is false
- */
-const cleanExtractedText = (
+const AVAILABLE_VOICES = [
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+  "verse",
+  "marin",
+  "cedar",
+];
+
+const AVAILABLE_STYLES = [
+  "calm",
+  "friendly",
+  "professional",
+  "storytelling",
+  "energetic",
+  "gentle",
+];
+
+const STYLE_INSTRUCTIONS = {
+  calm:
+    "Speak calmly and clearly with a relaxed, steady pace.",
+
+  friendly:
+    "Speak warmly and naturally, like a helpful friend.",
+
+  professional:
+    "Speak clearly and professionally with confident pacing.",
+
+  storytelling:
+    "Read expressively like a thoughtful storyteller while remaining easy to understand.",
+
+  energetic:
+    "Speak with lively, positive energy while remaining clear.",
+
+  gentle:
+    "Speak softly and gently with a comforting tone.",
+};
+
+const cleanText = (
   value
 ) => {
-  const rawText =
-    Array.isArray(value)
-      ? value
-          .filter(
-            (item) =>
-              typeof item ===
-              "string"
-          )
-          .join("\n\n")
-      : typeof value ===
-          "string"
-        ? value
-        : "";
+  if (
+    typeof value !==
+    "string"
+  ) {
+    return "";
+  }
 
-  return rawText
+  return value
     .replace(
       /\u0000/g,
       ""
@@ -72,441 +123,127 @@ const cleanExtractedText = (
       ""
     )
     .replace(
-      /[ \t]+/g,
+      /\s+/g,
       " "
-    )
-    .replace(
-      / *\n */g,
-      "\n"
-    )
-    .replace(
-      /\n{3,}/g,
-      "\n\n"
     )
     .trim();
 };
 
-/*
- * Checks whether the uploaded buffer
- * looks like a real PDF.
- */
-const isPdfBuffer = (
-  buffer
+const clampNumber = (
+  value,
+  minimum,
+  maximum,
+  fallback
 ) => {
+  const parsed =
+    Number(value);
+
   if (
-    !Buffer.isBuffer(
-      buffer
-    ) ||
-    buffer.length < 5
+    !Number.isFinite(
+      parsed
+    )
   ) {
-    return false;
+    return fallback;
   }
 
-  /*
-   * Most PDFs start with %PDF-.
-   *
-   * Some valid PDFs have a few bytes
-   * before the header, so inspect the
-   * first 1 KB.
-   */
-  const beginning =
-    buffer
-      .subarray(
-        0,
-        Math.min(
-          buffer.length,
-          1024
-        )
-      )
-      .toString(
-        "latin1"
-      );
-
-  return beginning.includes(
-    "%PDF-"
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      parsed
+    )
   );
 };
 
-/*
- * Extracts text directly from the
- * Multer memory buffer.
- *
- * S3 is not involved in extraction.
- */
-const extractPdfTextFromBuffer =
-  async (
-    pdfBuffer
-  ) => {
-    if (
-      !isPdfBuffer(
-        pdfBuffer
-      )
-    ) {
-      throw new Error(
-        "The uploaded file does not contain a valid PDF header."
-      );
-    }
-
-    /*
-     * Always create a fresh byte array.
-     *
-     * This prevents PDF.js from sharing or
-     * modifying the same memory later used
-     * for the S3 upload.
-     */
-    const createPdfBytes =
-      () =>
-        Uint8Array.from(
-          pdfBuffer
-        );
-
-    let pdf =
-      null;
-
-    let totalPages =
-      0;
-
-    let mergedExtractionError =
-      null;
-
-    try {
-      /*
-       * First attempt:
-       * create a PDF document proxy.
-       */
-      pdf =
-        await getDocumentProxy(
-          createPdfBytes()
-        );
-
-      totalPages =
-        Number(
-          pdf.numPages ||
-            0
-        );
-
-      /*
-       * First extraction method:
-       * merge all pages into one string.
-       */
-      try {
-        const mergedResult =
-          await extractText(
-            pdf,
-            {
-              mergePages:
-                true,
-            }
-          );
-
-        totalPages =
-          Number(
-            mergedResult
-              .totalPages ||
-              totalPages ||
-              0
-          );
-
-        const mergedText =
-          cleanExtractedText(
-            mergedResult.text
-          );
-
-        if (mergedText) {
-          return {
-            text:
-              mergedText,
-
-            totalPages,
-
-            method:
-              "merged",
-          };
-        }
-      } catch (error) {
-        mergedExtractionError =
-          error;
-
-        console.error(
-          "Merged PDF extraction failed:",
-          {
-            name:
-              error?.name,
-
-            message:
-              error?.message,
-          }
-        );
-      }
-
-      /*
-       * Second extraction method:
-       * extract one string per page.
-       */
-      try {
-        const pageResult =
-          await extractText(
-            pdf,
-            {
-              mergePages:
-                false,
-            }
-          );
-
-        totalPages =
-          Number(
-            pageResult
-              .totalPages ||
-              totalPages ||
-              0
-          );
-
-        const pageText =
-          cleanExtractedText(
-            pageResult.text
-          );
-
-        return {
-          text:
-            pageText,
-
-          totalPages,
-
-          method:
-            "pages",
-        };
-      } catch (pageError) {
-        console.error(
-          "Page-by-page PDF extraction failed:",
-          {
-            name:
-              pageError?.name,
-
-            message:
-              pageError?.message,
-          }
-        );
-
-        /*
-         * Throw the more recent error,
-         * unless only the merged method failed.
-         */
-        throw (
-          pageError ||
-          mergedExtractionError
-        );
-      }
-    } catch (proxyError) {
-      console.error(
-        "PDF proxy extraction failed:",
-        {
-          name:
-            proxyError?.name,
-
-          message:
-            proxyError?.message,
-        }
-      );
-
-      /*
-       * Final fallback:
-       *
-       * unpdf can also extract directly
-       * from raw PDF bytes without manually
-       * creating a document proxy.
-       */
-      const fallbackResult =
-        await extractText(
-          createPdfBytes(),
-          {
-            mergePages:
-              false,
-          }
-        );
-
-      const fallbackText =
-        cleanExtractedText(
-          fallbackResult.text
-        );
-
-      return {
-        text:
-          fallbackText,
-
-        totalPages:
-          Number(
-            fallbackResult
-              .totalPages ||
-              totalPages ||
-              0
-          ),
-
-        method:
-          "raw-bytes",
-      };
-    } finally {
-      if (
-        pdf &&
-        typeof pdf.destroy ===
-          "function"
-      ) {
-        try {
-          await pdf.destroy();
-        } catch (
-          destroyError
-        ) {
-          console.warn(
-            "Could not destroy PDF proxy:",
-            destroyError
-          );
-        }
-      }
-    }
-  };
-
-const calculateDocumentStats = (
-  text
-) => {
-  const words =
-    text
-      .split(/\s+/)
-      .filter(Boolean);
-
-  const wordCount =
-    words.length;
-
-  return {
-    wordCount,
-
-    estimatedMinutes:
-      wordCount > 0
-        ? Math.max(
-            1,
-            Math.ceil(
-              wordCount /
-                150
-            )
-          )
-        : 0,
-  };
-};
-
-/*
- * Upload requests send clerkUuid
- * in req.body.
- *
- * GET and DELETE requests send
- * clerkUuid in req.query.
- */
-const getClerkUuid = (
-  req
-) => {
-  const bodyValue =
-    typeof req.body
-      ?.clerkUuid ===
-    "string"
-      ? req.body
-          .clerkUuid
-          .trim()
-      : "";
-
-  const queryValue =
-    typeof req.query
-      ?.clerkUuid ===
-    "string"
-      ? req.query
-          .clerkUuid
-          .trim()
-      : "";
-
-  return (
-    bodyValue ||
-    queryValue
-  );
-};
-
-const sanitizeFileName = (
-  fileName
-) => {
-  const fallbackName =
-    "document.pdf";
-
-  if (
-    typeof fileName !==
-      "string" ||
-    !fileName.trim()
-  ) {
-    return fallbackName;
-  }
-
-  const cleaned =
-    fileName
-      .trim()
-      .replace(
-        /[^a-zA-Z0-9._-]/g,
-        "_"
-      )
-      .replace(
-        /_+/g,
-        "_"
-      );
-
-  if (
-    cleaned
-      .toLowerCase()
-      .endsWith(".pdf")
-  ) {
-    return cleaned;
-  }
-
-  return `${cleaned}.pdf`;
-};
-
-const createS3Key = ({
-  clerkUuid,
-  documentId,
-  originalName,
+const getSpeechFilename = ({
+  text,
+  voice,
+  style,
+  speed,
 }) => {
-  const safeName =
-    sanitizeFileName(
-      originalName
-    );
-
-  return (
-    `documents/` +
-    `${clerkUuid}/` +
-    `${documentId}-` +
-    `${safeName}`
-  );
-};
-
-const createSignedPdfUrl =
-  async (
-    s3Key,
-    originalName
-  ) => {
-    if (!s3Key) {
-      return null;
-    }
-
-    const safeName =
-      sanitizeFileName(
-        originalName
+  const hash =
+    crypto
+      .createHash(
+        "sha256"
+      )
+      .update(
+        JSON.stringify({
+          text,
+          voice,
+          style,
+          speed,
+        })
+      )
+      .digest(
+        "hex"
+      )
+      .slice(
+        0,
+        32
       );
 
+  return `${hash}.mp3`;
+};
+
+const getSpeechS3Key = (
+  filename
+) => {
+  return `speech/${filename}`;
+};
+
+const s3ObjectExists =
+  async (
+    key
+  ) => {
+    try {
+      await s3Client.send(
+        new HeadObjectCommand({
+          Bucket:
+            s3BucketName,
+
+          Key:
+            key,
+        })
+      );
+
+      return true;
+    } catch (error) {
+      const statusCode =
+        error?.$metadata
+          ?.httpStatusCode;
+
+      if (
+        statusCode === 404 ||
+        error?.name ===
+          "NotFound" ||
+        error?.name ===
+          "NoSuchKey"
+      ) {
+        return false;
+      }
+
+      throw error;
+    }
+  };
+
+const createSignedAudioUrl =
+  async (
+    key,
+    filename
+  ) => {
     const command =
       new GetObjectCommand({
         Bucket:
           s3BucketName,
 
         Key:
-          s3Key,
+          key,
 
         ResponseContentType:
-          "application/pdf",
+          "audio/mpeg",
 
         ResponseContentDisposition:
-          `inline; filename="${safeName}"`,
+          `inline; filename="${filename}"`,
       });
 
     return getSignedUrl(
@@ -519,874 +256,423 @@ const createSignedPdfUrl =
     );
   };
 
-const formatDocument =
-  async (
-    row
-  ) => {
-    const signedUrl =
-      await createSignedPdfUrl(
-        row.file_url,
-        row.name
-      );
+const getQuestionExcerpt = (
+  text
+) => {
+  if (
+    text.length <=
+    QUESTION_CONTEXT_LENGTH
+  ) {
+    return text;
+  }
 
-    return {
-      id:
-        row.id,
+  const maximumStart =
+    text.length -
+    QUESTION_CONTEXT_LENGTH;
 
-      clerkUuid:
-        row.clerk_uuid,
-
-      name:
-        row.name,
-
-      /*
-       * filename and file_url contain
-       * the private S3 object key.
-       */
-      filename:
-        row.filename,
-
-      mimeType:
-        row.mime_type,
-
-      size:
-        Number(
-          row.size_bytes ||
-            0
-        ),
-
-      /*
-       * Temporary private S3 URL.
-       */
-      url:
-        signedUrl,
-
-      /*
-       * The frontend turns this relative
-       * path into a complete backend URL.
-       */
-      textUrl:
-        `/api/documents/` +
-        `${encodeURIComponent(
-          row.id
-        )}/text?clerkUuid=${encodeURIComponent(
-          row.clerk_uuid
-        )}`,
-
-      pages:
-        Number(
-          row.pages ||
-            0
-        ),
-
-      wordCount:
-        Number(
-          row.word_count ||
-            0
-        ),
-
-      estimatedMinutes:
-        Number(
-          row
-            .estimated_minutes ||
-            0
-        ),
-
-      hasText:
-        Boolean(
-          row.has_text
-        ),
-
-      preview:
-        row.preview ||
-        "",
-
-      createdAt:
-        row.created_at instanceof
-        Date
-          ? row.created_at
-              .toISOString()
-          : row.created_at,
-
-      updatedAt:
-        row.updated_at instanceof
-        Date
-          ? row.updated_at
-              .toISOString()
-          : row.updated_at,
-    };
-  };
-
-const userExists =
-  async (
-    clerkUuid
-  ) => {
-    const rows =
-      await sql`
-        SELECT
-          clerk_uuid
-        FROM users
-        WHERE clerk_uuid =
-          ${clerkUuid}
-        LIMIT 1
-      `;
-
-    return rows.length > 0;
-  };
-
-const removeS3Object =
-  async (
-    s3Key
-  ) => {
-    if (!s3Key) {
-      return;
-    }
-
-    await s3Client.send(
-      new DeleteObjectCommand({
-        Bucket:
-          s3BucketName,
-
-        Key:
-          s3Key,
-      })
+  const randomStart =
+    Math.floor(
+      Math.random() *
+        (
+          maximumStart +
+          1
+        )
     );
-  };
+
+  const nextSpace =
+    text.indexOf(
+      " ",
+      randomStart
+    );
+
+  const start =
+    nextSpace >= 0 &&
+    nextSpace -
+      randomStart <
+      100
+      ? nextSpace + 1
+      : randomStart;
+
+  return text
+    .slice(
+      start,
+      start +
+        QUESTION_CONTEXT_LENGTH
+    )
+    .trim();
+};
+
+const formatGeneratedQuestion = (
+  value
+) => {
+  let question =
+    cleanText(
+      value
+    )
+      .replace(
+        /^(?:question|q)\s*:\s*/i,
+        ""
+      )
+      .replace(
+        /^\d+[.)]\s*/,
+        ""
+      )
+      .replace(
+        /^["'`]+|["'`]+$/g,
+        ""
+      )
+      .trim();
+
+  const questionMarkIndex =
+    question.indexOf(
+      "?"
+    );
+
+  if (
+    questionMarkIndex >=
+    0
+  ) {
+    question =
+      question.slice(
+        0,
+        questionMarkIndex +
+          1
+      );
+  } else if (
+    question
+  ) {
+    question += "?";
+  }
+
+  return question;
+};
 
 /*
- * POST /api/documents/upload
+ * GET /api/speech/options
  */
-export const uploadDocument =
+export const getSpeechOptions =
   async (
     req,
     res,
     next
   ) => {
-    let uploadedS3Key =
-      null;
-
     try {
-      if (!req.file) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
 
-            message:
-              "Please upload a PDF file.",
-          });
-      }
+          options: {
+            voices:
+              AVAILABLE_VOICES,
 
-      const clerkUuid =
-        getClerkUuid(req);
+            styles:
+              AVAILABLE_STYLES,
 
-      if (!clerkUuid) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
+            speeds: [
+              0.75,
+              1,
+              1.25,
+              1.5,
+            ],
 
-            message:
-              "A Clerk UUID is required.",
-          });
-      }
+            defaultVoice:
+              "coral",
 
-      const exists =
-        await userExists(
-          clerkUuid
+            defaultStyle:
+              "calm",
+
+            defaultSpeed:
+              1,
+          },
+        });
+    } catch (error) {
+      console.error(
+        "Get speech options error:",
+        error
+      );
+
+      next(error);
+    }
+  };
+
+/*
+ * POST /api/speech/generate
+ *
+ * Body:
+ * {
+ *   text: string,
+ *   voice?: string,
+ *   style?: string,
+ *   speed?: number
+ * }
+ */
+export const generateSpeech =
+  async (
+    req,
+    res,
+    next
+  ) => {
+    try {
+      const text =
+        cleanText(
+          req.body?.text
         );
 
-      if (!exists) {
+      const requestedVoice =
+        cleanText(
+          req.body?.voice
+        ).toLowerCase();
+
+      const requestedStyle =
+        cleanText(
+          req.body?.style
+        ).toLowerCase();
+
+      const voice =
+        AVAILABLE_VOICES.includes(
+          requestedVoice
+        )
+          ? requestedVoice
+          : "coral";
+
+      const style =
+        AVAILABLE_STYLES.includes(
+          requestedStyle
+        )
+          ? requestedStyle
+          : "calm";
+
+      const speed =
+        clampNumber(
+          req.body?.speed,
+          0.25,
+          4,
+          1
+        );
+
+      if (!text) {
         return res
-          .status(404)
+          .status(400)
           .json({
             success:
               false,
 
             message:
-              "User not found. Sync the Clerk user before uploading a PDF.",
+              "Speech text is required.",
           });
       }
-
-      const documentId =
-        req.documentId ||
-        crypto.randomUUID();
-
-      /*
-       * Multer memoryStorage places
-       * the uploaded PDF here.
-       */
-      const pdfBuffer =
-        req.file.buffer;
 
       if (
-        !pdfBuffer ||
-        !Buffer.isBuffer(
-          pdfBuffer
-        )
+        text.length >
+        MAX_SPEECH_LENGTH
       ) {
-        throw new Error(
-          "The uploaded PDF buffer is unavailable."
-        );
-      }
-
-      let extractedText =
-        "";
-
-      let totalPages =
-        0;
-
-      let extractionMethod =
-        null;
-
-      let extractionError =
-        null;
-
-      /*
-       * Extract text before uploading
-       * the PDF buffer to S3.
-       */
-      try {
-        const extraction =
-          await extractPdfTextFromBuffer(
-            pdfBuffer
-          );
-
-        extractedText =
-          extraction.text;
-
-        totalPages =
-          extraction.totalPages;
-
-        extractionMethod =
-          extraction.method;
-
-        console.log(
-          "PDF text extraction result:",
-          {
-            pages:
-              totalPages,
-
-            characters:
-              extractedText.length,
-
-            method:
-              extractionMethod,
-
-            hasText:
-              extractedText.length >
-              0,
-          }
-        );
-
-        if (!extractedText) {
-          extractionError =
-            "The PDF was uploaded, but it does not contain an extractable text layer. It may be scanned or image-only.";
-        }
-      } catch (error) {
-        console.error(
-          "PDF text extraction error:",
-          {
-            name:
-              error?.name,
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
 
             message:
-              error?.message,
-
-            stack:
-              error?.stack,
-          }
-        );
-
-        extractionError =
-          "The PDF was uploaded, but its text could not be extracted.";
+              `Speech text must be ${MAX_SPEECH_LENGTH} characters or fewer.`,
+          });
       }
 
-      const {
-        wordCount,
-        estimatedMinutes,
-      } =
-        calculateDocumentStats(
-          extractedText
+      const filename =
+        getSpeechFilename({
+          text,
+          voice,
+          style,
+          speed,
+        });
+
+      const s3Key =
+        getSpeechS3Key(
+          filename
         );
 
-      const preview =
-        extractedText.slice(
+      const cached =
+        await s3ObjectExists(
+          s3Key
+        );
+
+      if (!cached) {
+        const speech =
+          await openai
+            .audio
+            .speech
+            .create({
+              model:
+                process.env
+                  .OPENAI_SPEECH_MODEL ||
+                "gpt-4o-mini-tts",
+
+              voice,
+
+              input:
+                text,
+
+              instructions:
+                STYLE_INSTRUCTIONS[
+                  style
+                ],
+
+              response_format:
+                "mp3",
+
+              speed,
+            });
+
+        const audioBuffer =
+          Buffer.from(
+            await speech.arrayBuffer()
+          );
+
+        await s3Client.send(
+          new PutObjectCommand({
+            Bucket:
+              s3BucketName,
+
+            Key:
+              s3Key,
+
+            Body:
+              audioBuffer,
+
+            ContentType:
+              "audio/mpeg",
+
+            ContentLength:
+              audioBuffer.length,
+
+            ContentDisposition:
+              `inline; filename="${filename}"`,
+
+            CacheControl:
+              "private, max-age=31536000",
+
+            Metadata: {
+              voice,
+              style,
+
+              speed:
+                String(
+                  speed
+                ),
+            },
+          })
+        );
+
+        console.log(
+          "Speech uploaded to S3:",
+          {
+            bucket:
+              s3BucketName,
+
+            key:
+              s3Key,
+
+            size:
+              audioBuffer.length,
+          }
+        );
+      }
+
+      const url =
+        await createSignedAudioUrl(
+          s3Key,
+          filename
+        );
+
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
+
+          audio: {
+            voice,
+            style,
+            speed,
+            filename,
+
+            s3Key,
+
+            cached,
+
+            url,
+
+            expiresIn:
+              SIGNED_URL_EXPIRATION,
+
+            aiGenerated:
+              true,
+          },
+        });
+    } catch (error) {
+      console.error(
+        "Generate speech error:",
+        error
+      );
+
+      next(error);
+    }
+  };
+
+/*
+ * POST /api/speech/question
+ *
+ * Body:
+ * {
+ *   documentId: string,
+ *   previousQuestion?: string
+ * }
+ */
+export const generateQuestion =
+  async (
+    req,
+    res,
+    next
+  ) => {
+    try {
+      const documentId =
+        cleanText(
+          req.body
+            ?.documentId
+        );
+
+      const previousQuestion =
+        cleanText(
+          req.body
+            ?.previousQuestion
+        ).slice(
           0,
           500
         );
 
-      uploadedS3Key =
-        createS3Key({
-          clerkUuid,
+      if (!documentId) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
 
-          documentId,
-
-          originalName:
-            req.file
-              .originalname,
-        });
-
-      console.log(
-        "Uploading PDF to S3:",
-        {
-          bucket:
-            s3BucketName,
-
-          key:
-            uploadedS3Key,
-
-          size:
-            req.file.size,
-        }
-      );
-
-      /*
-       * Upload the original PDF buffer
-       * to private Amazon S3 storage.
-       */
-      await s3Client.send(
-        new PutObjectCommand({
-          Bucket:
-            s3BucketName,
-
-          Key:
-            uploadedS3Key,
-
-          Body:
-            pdfBuffer,
-
-          ContentType:
-            "application/pdf",
-
-          ContentLength:
-            req.file.size,
-
-          ContentDisposition:
-            `inline; filename="${sanitizeFileName(
-              req.file
-                .originalname
-            )}"`,
-
-          Metadata: {
-            documentid:
-              documentId,
-
-            clerkuuid:
-              clerkUuid,
-          },
-        })
-      );
-
-      console.log(
-        "Saving document to Neon:",
-        {
-          id:
-            documentId,
-
-          clerkUuid,
-
-          name:
-            req.file
-              .originalname,
-
-          s3Key:
-            uploadedS3Key,
-
-          pages:
-            totalPages,
-
-          wordCount,
-
-          extractionMethod,
-        }
-      );
+            message:
+              "documentId is required.",
+          });
+      }
 
       const rows =
         await sql`
-          INSERT INTO documents (
+          SELECT
             id,
-            clerk_uuid,
             name,
-            filename,
-            mime_type,
-            size_bytes,
-            file_url,
             extracted_text,
-            preview,
-            pages,
-            word_count,
-            estimated_minutes,
-            has_text,
-            created_at,
-            updated_at
-          )
-          VALUES (
-            ${documentId},
-            ${clerkUuid},
-            ${
-              req.file
-                .originalname
-            },
-            ${uploadedS3Key},
-            ${
-              req.file
-                .mimetype
-            },
-            ${
-              req.file
-                .size
-            },
-            ${uploadedS3Key},
-            ${extractedText},
-            ${preview},
-            ${totalPages},
-            ${wordCount},
-            ${
-              estimatedMinutes
-            },
-            ${
-              extractedText
-                .length > 0
-            },
-            NOW(),
-            NOW()
-          )
-          RETURNING *
-        `;
-
-      if (!rows.length) {
-        throw new Error(
-          "The document could not be saved to Neon."
-        );
-      }
-
-      const document =
-        await formatDocument(
-          rows[0]
-        );
-
-      return res
-        .status(201)
-        .json({
-          success:
-            true,
-
-          message:
-            extractionError ||
-            "PDF uploaded to S3 and saved successfully.",
-
-          extraction: {
-            success:
-              extractedText.length >
-              0,
-
-            characters:
-              extractedText.length,
-
-            pages:
-              totalPages,
-
-            method:
-              extractionMethod,
-
-            message:
-              extractionError,
-          },
-
-          document,
-        });
-    } catch (error) {
-      console.error(
-        "Upload document error:",
-        error
-      );
-
-      /*
-       * If S3 upload succeeded but the
-       * Neon insert failed, remove the
-       * unfinished S3 object.
-       */
-      if (uploadedS3Key) {
-        try {
-          await removeS3Object(
-            uploadedS3Key
-          );
-        } catch (
-          cleanupError
-        ) {
-          console.error(
-            "S3 cleanup error:",
-            cleanupError
-          );
-        }
-      }
-
-      if (
-        error?.code ===
-        "23505"
-      ) {
-        return res
-          .status(409)
-          .json({
-            success:
-              false,
-
-            message:
-              "This PDF already exists.",
-          });
-      }
-
-      if (
-        error?.name ===
-          "EntityTooLarge" ||
-        error?.code ===
-          "LIMIT_FILE_SIZE"
-      ) {
-        return res
-          .status(413)
-          .json({
-            success:
-              false,
-
-            message:
-              "The PDF is too large. The maximum size is 25 MB.",
-          });
-      }
-
-      next(error);
-    }
-  };
-
-/*
- * GET /api/documents
- */
-export const listDocuments =
-  async (
-    req,
-    res,
-    next
-  ) => {
-    try {
-      const clerkUuid =
-        getClerkUuid(req);
-
-      if (!clerkUuid) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
-
-            message:
-              "A Clerk UUID is required.",
-          });
-      }
-
-      const rows =
-        await sql`
-          SELECT
-            id,
-            clerk_uuid,
-            name,
-            filename,
-            mime_type,
-            size_bytes,
-            file_url,
-            preview,
-            pages,
-            word_count,
-            estimated_minutes,
-            has_text,
-            created_at,
-            updated_at
+            has_text
           FROM documents
-          WHERE clerk_uuid =
-            ${clerkUuid}
-          ORDER BY
-            created_at DESC
-          LIMIT 100
-        `;
-
-      const documents =
-        await Promise.all(
-          rows.map(
-            (row) =>
-              formatDocument(
-                row
-              )
-          )
-        );
-
-      return res
-        .status(200)
-        .json({
-          success:
-            true,
-
-          count:
-            documents.length,
-
-          documents,
-        });
-    } catch (error) {
-      console.error(
-        "List documents error:",
-        error
-      );
-
-      next(error);
-    }
-  };
-
-/*
- * GET /api/documents/:id
- */
-export const getDocument =
-  async (
-    req,
-    res,
-    next
-  ) => {
-    try {
-      const clerkUuid =
-        getClerkUuid(req);
-
-      if (!clerkUuid) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
-
-            message:
-              "A Clerk UUID is required.",
-          });
-      }
-
-      const rows =
-        await sql`
-          SELECT
-            id,
-            clerk_uuid,
-            name,
-            filename,
-            mime_type,
-            size_bytes,
-            file_url,
-            preview,
-            pages,
-            word_count,
-            estimated_minutes,
-            has_text,
-            created_at,
-            updated_at
-          FROM documents
-          WHERE
-            id =
-              ${req.params.id}
-            AND clerk_uuid =
-              ${clerkUuid}
-          LIMIT 1
-        `;
-
-      if (!rows.length) {
-        return res
-          .status(404)
-          .json({
-            success:
-              false,
-
-            message:
-              "Document not found.",
-          });
-      }
-
-      const document =
-        await formatDocument(
-          rows[0]
-        );
-
-      return res
-        .status(200)
-        .json({
-          success:
-            true,
-
-          document,
-        });
-    } catch (error) {
-      console.error(
-        "Get document error:",
-        error
-      );
-
-      next(error);
-    }
-  };
-
-/*
- * GET /api/documents/:id/text
- */
-export const getDocumentText =
-  async (
-    req,
-    res,
-    next
-  ) => {
-    try {
-      const clerkUuid =
-        getClerkUuid(req);
-
-      if (!clerkUuid) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
-
-            message:
-              "A Clerk UUID is required.",
-          });
-      }
-
-      const rows =
-        await sql`
-          SELECT
-            id,
-            clerk_uuid,
-            name,
-            pages,
-            word_count,
-            estimated_minutes,
-            has_text,
-            extracted_text
-          FROM documents
-          WHERE
-            id =
-              ${req.params.id}
-            AND clerk_uuid =
-              ${clerkUuid}
-          LIMIT 1
-        `;
-
-      if (!rows.length) {
-        return res
-          .status(404)
-          .json({
-            success:
-              false,
-
-            message:
-              "Document text not found.",
-          });
-      }
-
-      const document =
-        rows[0];
-
-      return res
-        .status(200)
-        .json({
-          success:
-            true,
-
-          document: {
-            id:
-              document.id,
-
-            clerkUuid:
-              document
-                .clerk_uuid,
-
-            name:
-              document.name,
-
-            pages:
-              Number(
-                document.pages ||
-                  0
-              ),
-
-            wordCount:
-              Number(
-                document
-                  .word_count ||
-                  0
-              ),
-
-            estimatedMinutes:
-              Number(
-                document
-                  .estimated_minutes ||
-                  0
-              ),
-
-            hasText:
-              Boolean(
-                document
-                  .has_text
-              ),
-
-            text:
-              document
-                .extracted_text ||
-              "",
-          },
-        });
-    } catch (error) {
-      console.error(
-        "Get document text error:",
-        error
-      );
-
-      next(error);
-    }
-  };
-
-/*
- * DELETE /api/documents/:id
- */
-export const deleteDocument =
-  async (
-    req,
-    res,
-    next
-  ) => {
-    try {
-      const clerkUuid =
-        getClerkUuid(req);
-
-      if (!clerkUuid) {
-        return res
-          .status(400)
-          .json({
-            success:
-              false,
-
-            message:
-              "A Clerk UUID is required.",
-          });
-      }
-
-      /*
-       * Read the S3 key before deleting
-       * the Neon document row.
-       */
-      const rows =
-        await sql`
-          SELECT
-            id,
-            filename,
-            file_url
-          FROM documents
-          WHERE
-            id =
-              ${req.params.id}
-            AND clerk_uuid =
-              ${clerkUuid}
+          WHERE id =
+            ${documentId}
           LIMIT 1
         `;
 
@@ -1405,29 +691,204 @@ export const deleteDocument =
       const document =
         rows[0];
 
-      const s3Key =
-        document.file_url ||
-        document.filename;
+      const documentText =
+        cleanText(
+          document
+            .extracted_text
+        );
 
-      /*
-       * Delete the actual PDF from S3.
-       */
-      await removeS3Object(
-        s3Key
+      if (
+        !document.has_text ||
+        !documentText
+      ) {
+        return res
+          .status(422)
+          .json({
+            success:
+              false,
+
+            message:
+              "This PDF does not contain readable text.",
+          });
+      }
+
+      const excerpt =
+        getQuestionExcerpt(
+          documentText
+        );
+
+      const instructions = [
+        "Write exactly one comprehension question about the PDF excerpt.",
+        "The answer must be present in the excerpt.",
+        "Return only the question.",
+        "Do not return an answer.",
+        "Do not include a label, explanation, hint, or numbering.",
+        "Use fewer than 24 words.",
+        "End with a question mark.",
+
+        previousQuestion
+          ? `Do not repeat this previous question: ${previousQuestion}`
+          : "",
+      ]
+        .filter(
+          Boolean
+        )
+        .join(
+          " "
+        );
+
+      const response =
+        await openai
+          .responses
+          .create({
+            model:
+              process.env
+                .OPENAI_QUESTION_MODEL ||
+              "gpt-5-mini",
+
+            store:
+              false,
+
+            max_output_tokens:
+              300,
+
+            reasoning: {
+              effort:
+                "minimal",
+            },
+
+            input: [
+              {
+                role:
+                  "developer",
+
+                content: [
+                  {
+                    type:
+                      "input_text",
+
+                    text:
+                      instructions,
+                  },
+                ],
+              },
+
+              {
+                role:
+                  "user",
+
+                content: [
+                  {
+                    type:
+                      "input_text",
+
+                    text: [
+                      `PDF title: ${
+                        document.name ||
+                        "Untitled PDF"
+                      }`,
+
+                      "PDF excerpt:",
+
+                      excerpt,
+                    ].join(
+                      "\n\n"
+                    ),
+                  },
+                ],
+              },
+            ],
+          });
+
+      console.log(
+        "Question response status:",
+        response.status
       );
 
-      /*
-       * Delete its metadata and extracted
-       * text from Neon.
-       */
-      await sql`
-        DELETE FROM documents
-        WHERE
-          id =
-            ${req.params.id}
-          AND clerk_uuid =
-            ${clerkUuid}
-      `;
+      console.log(
+        "Question incomplete details:",
+        response
+          .incomplete_details ||
+          null
+      );
+
+      console.log(
+        "Question output text:",
+        response.output_text
+      );
+
+      let rawQuestion =
+        typeof response
+          .output_text ===
+        "string"
+          ? response
+              .output_text
+          : "";
+
+      if (
+        !rawQuestion.trim()
+      ) {
+        rawQuestion =
+          response.output
+            ?.flatMap(
+              (
+                item
+              ) =>
+                item.type ===
+                "message"
+                  ? item.content ||
+                    []
+                  : []
+            )
+            .filter(
+              (
+                content
+              ) =>
+                content.type ===
+                "output_text"
+            )
+            .map(
+              (
+                content
+              ) =>
+                content.text ||
+                ""
+            )
+            .join(
+              " "
+            )
+            .trim() ||
+          "";
+      }
+
+      const question =
+        formatGeneratedQuestion(
+          rawQuestion
+        );
+
+      if (!question) {
+        console.error(
+          "Empty question response:",
+          JSON.stringify(
+            response,
+            null,
+            2
+          )
+        );
+
+        return res
+          .status(502)
+          .json({
+            success:
+              false,
+
+            message:
+              response.status ===
+              "incomplete"
+                ? "The AI response was incomplete. Please try again."
+                : "The AI did not generate a question. Please try again.",
+          });
+      }
 
       return res
         .status(200)
@@ -1435,84 +896,14 @@ export const deleteDocument =
           success:
             true,
 
-          message:
-            "Document deleted from S3 and Neon.",
+          question,
         });
     } catch (error) {
       console.error(
-        "Delete document error:",
+        "Generate question error:",
         error
       );
 
       next(error);
-    }
-  };
-
-/*
- * GET /api/documents/health
- */
-export const getServerHealth =
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const result =
-        await sql`
-          SELECT
-            NOW() AS database_time
-        `;
-
-      return res
-        .status(200)
-        .json({
-          success:
-            true,
-
-          message:
-            "Readio server is running.",
-
-          database:
-            "connected",
-
-          storage:
-            "Amazon S3",
-
-          bucket:
-            s3BucketName,
-
-          databaseTime:
-            result[0]
-              .database_time,
-
-          timestamp:
-            new Date()
-              .toISOString(),
-        });
-    } catch (error) {
-      console.error(
-        "Neon health error:",
-        error
-      );
-
-      return res
-        .status(503)
-        .json({
-          success:
-            false,
-
-          message:
-            "Readio is running, but Neon is unavailable.",
-
-          database:
-            "disconnected",
-
-          storage:
-            "Amazon S3",
-
-          timestamp:
-            new Date()
-              .toISOString(),
-        });
     }
   };
