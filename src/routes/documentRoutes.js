@@ -30,7 +30,9 @@ router.get(
 
 router.post(
   "/upload",
-  uploadPdf.single("pdf"),
+  uploadPdf.single(
+    "pdf"
+  ),
   uploadDocument
 );
 

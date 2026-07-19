@@ -1,61 +1,69 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+
 import multer from "multer";
 
-const uploadsDirectory = path.resolve("uploads");
+const MAX_FILE_SIZE =
+  25 * 1024 * 1024;
 
-fs.mkdirSync(uploadsDirectory, {
-  recursive: true,
-});
+const storage =
+  multer.memoryStorage();
 
-const storage = multer.diskStorage({
-  destination: (req, file, callback) => {
-    callback(null, uploadsDirectory);
-  },
+const fileFilter = (
+  req,
+  file,
+  callback
+) => {
+  const isPdfMimeType =
+    file.mimetype ===
+    "application/pdf";
 
-  filename: (req, file, callback) => {
-    const id = crypto.randomUUID();
+  const isPdfExtension =
+    file.originalname
+      ?.toLowerCase()
+      .endsWith(".pdf");
 
-    const extension =
-      path.extname(file.originalname).toLowerCase() || ".pdf";
-
-    const safeName = path
-      .basename(file.originalname, extension)
-      .replace(/[^a-zA-Z0-9-_]/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 70);
-
-    req.documentId = id;
-
-    callback(
-      null,
-      `${id}-${safeName || "document"}${extension}`
+  if (
+    !isPdfMimeType ||
+    !isPdfExtension
+  ) {
+    return callback(
+      new Error(
+        "Only PDF files are allowed."
+      )
     );
-  },
-});
-
-const pdfFileFilter = (req, file, callback) => {
-  const hasPdfMimeType =
-    file.mimetype === "application/pdf";
-
-  const hasPdfExtension =
-    file.originalname.toLowerCase().endsWith(".pdf");
-
-  if (!hasPdfMimeType && !hasPdfExtension) {
-    callback(new Error("Only PDF files are allowed."));
-    return;
   }
 
-  callback(null, true);
+  callback(
+    null,
+    true
+  );
 };
 
-export const uploadPdf = multer({
-  storage,
-  fileFilter: pdfFileFilter,
-  limits: {
-    fileSize: 20 * 1024 * 1024,
-    files: 1,
-  },
-}); 
+export const uploadPdf =
+  multer({
+    storage,
+
+    fileFilter,
+
+    limits: {
+      fileSize:
+        MAX_FILE_SIZE,
+
+      files: 1,
+    },
+  });
+
+/*
+ * Optional helper if anything else in
+ * your project still expects req.documentId.
+ */
+export const createDocumentId = (
+  req,
+  res,
+  next
+) => {
+  req.documentId =
+    crypto.randomUUID();
+
+  next();
+};
